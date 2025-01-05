@@ -21,7 +21,7 @@ class DL(DataLoader):
                     if i % torch.distributed.get_world_size() != torch.distributed.get_rank():
                         continue
                 # Use the dataset-specific text processor
-                sample_tokens = self.tokenizer.encode(sample["text"])
+                sample_tokens = self.tokenizer.encode(sample["text"], add_special_tokens=False)
                 self._all_tokens.extend(sample_tokens)
                 self._sample_idx += 1
 

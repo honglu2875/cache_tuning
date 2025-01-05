@@ -4,6 +4,7 @@ import torch
 from contextlib import nullcontext
 import torch.distributed._functional_collectives as fcol
 from torch.optim import Adam
+from torch.nn.functional import avg_pool1d
 import torch
 import tqdm
 from transformers.cache_utils import DynamicCache, StaticCache
@@ -15,7 +16,10 @@ BATCH_SIZE = 16
 MICRO_BS = 16
 COMPRESSED_LENGTH = 10
 SEQ_LEN = 512
-TRAIN_STEP = 200
+TRAIN_STEP = 100
+
+
+GRAD_ACC = BATCH_SIZE // MICRO_BS
 
 def batch(it):
     buffer = []
@@ -43,6 +47,9 @@ def train(model, inputs, ref_cache, init_keys, init_vals, pos_offset, device):
         return loss
 
 def main():
+    # Massive speed boost from enabling fp32 tensor core
+    torch.set_float32_matmul_precision('high')
+
     torch.distributed.init_process_group(backend="nccl")
     mesh_dp = torch.distributed.init_device_mesh("cuda", mesh_shape=(torch.distributed.get_world_size(),))
     process_group = mesh_dp.get_group()
@@ -51,7 +58,7 @@ def main():
 
     model_name = "NousResearch/Llama-3.2-1B"
     # I'd rather waste a cpu copy than using `accelerate`
-    model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+    model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager").to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     for param in model.parameters():
@@ -66,20 +73,32 @@ def main():
     past_key_values = StaticCache(config=model.config, max_batch_size=MICRO_BS, max_cache_len=512, device=device, dtype=model.dtype)
 
 
-    tok_input = tokenizer([PROMPT], return_tensors="pt").to(device)
+    tok_input = tokenizer([PROMPT], return_tensors="pt", add_special_tokens=False).to(device)
+    PROMPT_LEN = tok_input.input_ids.shape[1]
+    FILL_LEN = SEQ_LEN - PROMPT_LEN
     # populate cache
     repeated_tok_input = tok_input.input_ids.repeat(MICRO_BS, 1)
     with torch.no_grad():
         output = model(repeated_tok_input, use_cache=True, past_key_values=past_key_values)
 
     # init compressed cache
-    def _fn(*shape):
-        #return torch.randn(shape, dtype=torch.float32, device="cuda", requires_grad=True)
-        return torch.zeros(shape, dtype=torch.float32, device=device, requires_grad=True)
+    def _fn(shape, tensor):
+        #return torch.randn(shape, dtype=torch.float32, device=device, requires_grad=True)
+        #return torch.zeros(shape, dtype=torch.float32, device=device, requires_grad=True)
+
+        #stride = PROMPT_LEN // COMPRESSED_LENGTH
+        #kernel_size = stride * 2
+        #p = tensor.permute((0, 1, 3, 2))
+        #p = p.reshape(tensor.shape[0], -1, tensor.shape[2])
+        #contracted = avg_pool1d(p, kernel_size=kernel_size, stride=stride, ceil_mode=True).permute((0, 2, 1))
+        #contracted = contracted[:, -COMPRESSED_LENGTH:].reshape(shape)
+        #return contracted
+
+        return tensor[:, :, -COMPRESSED_LENGTH:].clone()
 
     _, nh, _, hd = past_key_values.key_cache[0].shape
-    init_keys = [_fn(1, nh, COMPRESSED_LENGTH, hd) for _ in range(len(past_key_values.key_cache))]
-    init_vals = [_fn(1, nh, COMPRESSED_LENGTH, hd) for _ in range(len(past_key_values.value_cache))]
+    init_keys = [_fn((1, nh, COMPRESSED_LENGTH, hd), k[:1, :, :PROMPT_LEN]) for k in past_key_values.key_cache]
+    init_vals = [_fn((1, nh, COMPRESSED_LENGTH, hd), v[:1, :, :PROMPT_LEN]) for v in past_key_values.value_cache]
 
 
     
@@ -88,10 +107,7 @@ def main():
     params = init_keys + init_vals
     for p in params:
         p.requires_grad = True
-    opt = Adam(params, lr=0.01)
-    PROMPT_LEN = tok_input.input_ids.shape[1]
-    FILL_LEN = SEQ_LEN - PROMPT_LEN
-    GRAD_ACC = BATCH_SIZE // MICRO_BS
+    opt = Adam(params, lr=1)
 
 
     #compiled = torch.compile(model)
@@ -137,7 +153,7 @@ def main():
         print("----- eval -----")
 
         eval_prompt = "\nRepeat the above code:"
-        eval_tok = tokenizer([eval_prompt], return_tensors="pt").input_ids
+        eval_tok = tokenizer([eval_prompt], return_tensors="pt", add_special_tokens=False).input_ids
         eval_inp = torch.zeros((1, COMPRESSED_LENGTH + eval_tok.shape[1]), dtype=eval_tok.dtype, device=device)
         eval_inp[:, -eval_tok.shape[1]:].copy_(eval_tok)
         
