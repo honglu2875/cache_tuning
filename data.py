@@ -1,3 +1,4 @@
+from torch.distributed import is_initialized
 from torch.utils.data import DataLoader
 import torch
 
@@ -14,7 +15,11 @@ class DL(DataLoader):
         max_buffer_token_len = 1 + SEQ_LEN
 
         while True:
-            for sample in iter(self.dataset):
+            for i, sample in enumerate(iter(self.dataset)):
+                # Quite wasteful to stream (download) the same data on each rank, but I note the issue and leave it for now.
+                if torch.distributed.is_initialized():
+                    if i % torch.distributed.get_world_size() != torch.distributed.get_rank():
+                        continue
                 # Use the dataset-specific text processor
                 sample_tokens = self.tokenizer.encode(sample["text"])
                 self._all_tokens.extend(sample_tokens)
