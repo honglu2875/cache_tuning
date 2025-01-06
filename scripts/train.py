@@ -7,16 +7,17 @@ from torch.optim import Adam
 from torch.nn.functional import avg_pool1d
 import torch
 import tqdm
+import math
 from transformers.cache_utils import DynamicCache, StaticCache
-from prompts import PROMPT
-from data import DL
+from cache_tuning.sample_prompts import QUICKSORT_PROMPT as PROMPT
+from cache_tuning.data import TokenizedDataLoader
 
 
 BATCH_SIZE = 16 
 MICRO_BS = 16
-COMPRESSED_LENGTH = 10
+COMPRESSED_LENGTH = 1
 SEQ_LEN = 512
-TRAIN_STEP = 100
+TRAIN_STEP = 1000
 
 
 GRAD_ACC = BATCH_SIZE // MICRO_BS
@@ -66,7 +67,7 @@ def main():
 
 
     ds = datasets.load_dataset("togethercomputer/RedPajama-Data-1T-Sample").shuffle(42)
-    dl = DL(ds["train"], tokenizer)
+    dl = TokenizedDataLoader(ds["train"], tokenizer)
 
 
 
@@ -107,7 +108,7 @@ def main():
     params = init_keys + init_vals
     for p in params:
         p.requires_grad = True
-    opt = Adam(params, lr=1)
+    opt = Adam(params, lr=0.01)
 
 
     #compiled = torch.compile(model)
@@ -132,7 +133,7 @@ def main():
             if rank == 0:
                 with torch.no_grad():
                     grad_sq = sum(p.grad.square().sum()/p.numel() for p in params) / len(params)
-                    line1.set_description(f"loss: {loss.item()}, grad_norm: {torch.sqrt(grad_sq).item()}.")
+                    line1.set_description(f"loss: {loss.item()}, grad_norm: {math.sqrt(grad_sq)}.")
                     line2.set_description(f"slice of key cache: {[f'{k.item():.4f}' for k in init_keys[0][0, 0, :20, 0]]}.")
                     pbar.update(1)
 
@@ -164,7 +165,7 @@ def main():
                 eval_cache.key_cache[i][:, :, :k.shape[2]].copy_(k)
                 eval_cache.value_cache[i][:, :, :v.shape[2]].copy_(v)
 
-            print("slice of key cache:", eval_cache.key_cache[0][0, 0, :, 0])
+            #print("slice of key cache:", eval_cache.key_cache[0][0, 0, :, 0])
             print("infered seq len:", eval_cache.get_seq_length())
 
             torch.save((eval_cache.key_cache, eval_cache.value_cache), "cache.pt")

@@ -2,17 +2,17 @@ from torch.distributed import is_initialized
 from torch.utils.data import DataLoader
 import torch
 
-SEQ_LEN = 512
-class DL(DataLoader):
-    def __init__(self, dataset, tokenizer):
+class TokenizedDataLoader(DataLoader):
+    def __init__(self, dataset, tokenizer, seq_len=512):
         self.dataset = dataset
         self.tokenizer = tokenizer
         self._all_tokens = []
         self._sample_idx = 0
+        self.seq_len = seq_len
         self.infinite = True
 
     def __iter__(self):
-        max_buffer_token_len = 1 + SEQ_LEN
+        max_buffer_token_len = 1 + self.seq_len
 
         while True:
             for i, sample in enumerate(iter(self.dataset)):

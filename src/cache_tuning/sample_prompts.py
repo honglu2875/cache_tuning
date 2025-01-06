@@ -1,4 +1,4 @@
-PROMPT = """You are given the following code
+QUICKSORT_PROMPT = """You are given the following code
 ```python
 def sort(array):
     '''Sort the array by using quicksort.'''
