@@ -134,7 +134,7 @@ def main():
                     with torch.no_grad():
                         grad_sq = sum(p.grad.square().sum()/p.numel() for p in params) / len(params)
                         line1.set_description(f"loss: {loss.item()}, grad_norm: {math.sqrt(grad_sq)}.")
-                        line2.set_description(f"slice of key cache: {[f'{k.item():.4f}' for k in init_keys[0][0, 0, :20, 0]]}.")
+                        line2.set_description(f"slice of key cache: {', '.join(f'{k.item():.4f}' for k in init_keys[0][0, 0, :20, 0])}.")
                         pbar.update(1)
 
                 if (i + 1) % GRAD_ACC == 0:
@@ -152,39 +152,42 @@ def main():
 
         past_key_values = StaticCache(config=model.config, max_batch_size=1, max_cache_len=MAX_SEQ_LEN, device=device, dtype=model.dtype)
 
-        if rank == 0:
-            print("----- generate -----")
 
+        if rank == 0:
             eval_prompt = "\n## Advanced topic\n\nGiven the previous knowledge, we can go one step forward:\n"
             eval_tok = tokenizer([eval_prompt], return_tensors="pt", add_special_tokens=False).input_ids
             eval_inp = torch.zeros((1, COMPRESSED_LENGTH + eval_tok.shape[1]), dtype=eval_tok.dtype, device=device)
             eval_inp[:, -eval_tok.shape[1]:].copy_(eval_tok)
-            
+        
 
             with torch.no_grad():
                 for i, (k, v) in enumerate(zip(init_keys, init_vals)):
                     past_key_values.key_cache[i][:, :, :k.shape[2]].copy_(k)
                     past_key_values.value_cache[i][:, :, :v.shape[2]].copy_(v)
 
-                torch.save((past_key_values.key_cache, past_key_values.value_cache), f"cache_{epoch}.pt")
                 
                 res = model.generate(
                     input_ids=eval_inp,
                     use_cache=True, past_key_values=past_key_values,
                     max_new_tokens=SEQ_LEN - eval_inp.shape[1],
+                    min_new_tokens=SEQ_LEN - eval_inp.shape[1],
                     do_sample=True,
                     temperature=0.5,
                 )
+
+                print("----- generate -----")
                 print(tokenizer.batch_decode(res[:, COMPRESSED_LENGTH:])[0])
-                with open("log.txt", "a") as f:
+
+                torch.save((init_keys, init_vals), f"cache_{epoch}.pt")
+                with open(f"log_{rank}.txt", "a") as f:
                     f.write(f"\n--- epoch {epoch} ---\n")
                     f.write(tokenizer.batch_decode(res[:, eval_inp.shape[1]:])[0])
 
         torch.cuda.synchronize()
         torch.distributed.barrier(group=process_group, device_ids=[rank])
 
-        past_key_values.key_cache = [fcol.broadcast(k, 0, process_group).repeat(MICRO_BS, 1, 1, 1) for k in past_key_values.key_cache]
-        past_key_values.value_cache = [fcol.broadcast(v, 0, process_group).repeat(MICRO_BS, 1, 1, 1) for v in past_key_values.value_cache]
+        past_key_values.key_cache = [fcol.all_reduce(k, "sum", process_group).repeat(MICRO_BS, 1, 1, 1) for k in past_key_values.key_cache]
+        past_key_values.value_cache = [fcol.all_reduce(v, "sum", process_group).repeat(MICRO_BS, 1, 1, 1) for v in past_key_values.value_cache]
 
         torch.cuda.synchronize()
         torch.distributed.barrier(group=process_group, device_ids=[rank])
