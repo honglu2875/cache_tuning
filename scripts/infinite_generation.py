@@ -22,6 +22,20 @@ TRAIN_STEP = 500
 
 
 GRAD_ACC = BATCH_SIZE // MICRO_BS
+PROMPT = """# Preface
+The  author  offers  this  brief  Life  of  Martin 
+Luther  as  her  contribution  to  the  literature  of 
+the  Four  Hundredth  Anniversary  of  the  Refor- 
+mation. The  volume  contains  no  original  ma- 
+terial, but  is  intended  to  serve  as  an  introduc- 
+tion to  the  longer,  richer,  and  more  scholarly 
+records  of  a  great  life  which  abound  and  to 
+the  noble  writings  of  the  Reformer  himself. 
+Grateful  acknowledgment  is  made  to  the  biog- 
+raphers of  Luther,  especially  to  Dr.  Henry  E. 
+Jacobs,  to  Dr.  Preserved  Smith,  and  to  Heinrich 
+Bohmer,  the  author  of  Luther  in  the  Light  of 
+Recent  Research."""
 
 def batch(it):
     prefetch_interval = 1024
@@ -154,7 +168,8 @@ def main():
 
 
         if rank == 0:
-            eval_prompt = "\n## Advanced topic\n\nGiven the previous knowledge, we can go one step forward:\n"
+            #eval_prompt = "\n## Advanced topic\n\nGiven the previous knowledge, we can go one step forward:\n"
+            eval_prompt = "\n"
             eval_tok = tokenizer([eval_prompt], return_tensors="pt", add_special_tokens=False).input_ids
             eval_inp = torch.zeros((1, COMPRESSED_LENGTH + eval_tok.shape[1]), dtype=eval_tok.dtype, device=device)
             eval_inp[:, -eval_tok.shape[1]:].copy_(eval_tok)
