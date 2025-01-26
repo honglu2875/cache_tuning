@@ -8,6 +8,7 @@ from torch.nn.functional import avg_pool1d
 import torch
 import tqdm
 import math
+import wandb
 from transformers.cache_utils import DynamicCache, StaticCache
 from cache_tuning.sample_prompts import QUICKSORT_PROMPT as PROMPT
 from cache_tuning.data import TokenizedDataLoader
@@ -59,7 +60,8 @@ def main():
     device = torch.device(rank % 8)
 
     #model_name = "NousResearch/Llama-3.2-1B"
-    model_name = "NousResearch/Meta-Llama-3.1-8B"
+    #model_name = "NousResearch/Meta-Llama-3.1-8B"
+    model_name = "allenai/OLMo-2-1124-7B-Instruct"
     # I'd rather waste a cpu copy than using `accelerate`
     model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="sdpa", torch_dtype=torch.bfloat16).to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -77,9 +79,24 @@ def main():
     ds = datasets.load_dataset("togethercomputer/RedPajama-Data-1T-Sample").shuffle(42)
     dl = TokenizedDataLoader(ds["train"], tokenizer, seq_len=1024)
 
+    wandb.init(
+        project="cache_tuning",
+        config={
+            "model": model_name,
+            "num_caches": NUM,
+            "batch_size": BATCH_SIZE,
+            "micro_bs": MICRO_BS,
+            "compressed_len": COMPRESSED_LENGTH,
+            "seq_len": SEQ_LEN,
+            "max_seq_len": MAX_SEQ_LEN,
+            "train_step": TRAIN_STEP,
+        },
+        mode="disabled" if rank > 0 else "online",
+    )
     FILL_LEN = MAX_SEQ_LEN - SEQ_LEN
     for idx in range(NUM):
         tok_input = torch.tensor([prompt[idx * SEQ_LEN: (idx + 1) * SEQ_LEN]], device=device)
+        text_prompt = tokenizer.decode(prompt[idx * SEQ_LEN: (idx + 1) * SEQ_LEN])
         start = idx * COMPRESSED_LENGTH
         # populate cache
         repeated_tok_input = tok_input.repeat(MICRO_BS, 1)
@@ -117,7 +134,7 @@ def main():
         params = init_keys + init_vals
         for p in params:
             p.requires_grad = True
-        opt = Adam(params, lr=0.01)
+        opt = Adam(params, lr=0.05)
 
 
         #compiled = torch.compile(model)
@@ -131,6 +148,8 @@ def main():
         line1 = tqdm.tqdm(bar_format='{desc}{postfix}', position=0) if rank == 0 else nullcontext()
         line2 = tqdm.tqdm(bar_format='{desc}{postfix}', position=1) if rank == 0 else nullcontext()
         pbar = tqdm.tqdm(total=TRAIN_STEP, position=2) if rank == 0 else nullcontext()
+        losses = []
+        grad_norms = []
         with line1, line2, pbar:
             opt.zero_grad(set_to_none=True)
             loss, grad_sq = None, None
@@ -149,7 +168,9 @@ def main():
                     with torch.no_grad():
                         grad_sq = sum(p.grad.square().sum()/p.numel() for p in params) / len(params)
                         line1.set_description(f"loss: {loss.item()}, grad_norm: {math.sqrt(grad_sq)}.")
-                        line2.set_description(f"slice of key cache: {[f'{k.item():.4f}' for k in init_keys[0][0, 0, :20, 0]]}.")
+                        line2.set_description(f"slice of key cache: {[f'{k.item():.4f}' for k in init_keys[0][0, 0, :15, 0]]}.")
+                        losses.append(loss.item())
+                        grad_norms.append(math.sqrt(grad_sq.item()))
                         pbar.update(1)
 
                 if (i + 1) % GRAD_ACC == 0:
@@ -176,7 +197,8 @@ def main():
         if rank == 0:
             print("----- eval -----")
             next_start = start + COMPRESSED_LENGTH
-            eval_prompt = "\nGiven an algebraic scheme, "
+            lemma = """Any finitely generated ring over a Noetherian ring is Noetherian. Any localization of a Noetherian ring is Noetherian."""
+            eval_prompt = f"\nRead through the previous textbook and understand it well. Prove the following lemma: {lemma}\n<|assistant|>\n"
             eval_tok = tokenizer([eval_prompt] * MICRO_BS, return_tensors="pt", add_special_tokens=False).input_ids
             eval_inp = torch.zeros((MICRO_BS, next_start + eval_tok.shape[1]), dtype=eval_tok.dtype, device=device)
             eval_inp[:, -eval_tok.shape[1]:].copy_(eval_tok)
@@ -189,7 +211,15 @@ def main():
                                  use_cache=True, past_key_values=past_key_values,
                                  #cache_position=torch.arange(eval_tok.shape[1], device=device) + next_start,
                                  max_new_tokens=200)
-            print(tokenizer.batch_decode(res[:, next_start:])[0])
+            eval_gen = tokenizer.batch_decode(res[:, next_start:])[0]
+            print(eval_gen)
+
+            wandb.log({
+                "avg_last_10_loss": sum(losses[-10:]) / 10,
+                "avg_last_10_grad_norm": sum(grad_norms[-10:]) /10,
+                "text_prompt": text_prompt,
+                "eval_generation": eval_gen,
+            })
 
     torch.distributed.destroy_process_group()
 
